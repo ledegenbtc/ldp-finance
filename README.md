@@ -54,3 +54,4 @@ data/
 ## Reference
 
 Lopez de Prado, M. (2018). *Advances in Financial Machine Learning*. Wiley.
+# ldp-finance
