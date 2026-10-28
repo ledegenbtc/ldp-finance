@@ -420,6 +420,7 @@ def display_pipeline_menu(config: PipelineConfig):
 
     print("\n🤖 Machine Learning:")
     print("9. 🔍 Search Classificator")
+    print("10. 🗑️  Delete old experiments (sample weights before the 2026-10-28 fix)")
 
     print("\n0. 🚪 Exit")
 
@@ -809,6 +810,90 @@ def delete_all_data():
     print(f"\n✅ Database wipe completed!")
     print(f"   • Deleted directories: {deleted_dirs}")
     print(f"   • Deleted files: {deleted_files}")
+    print(f"   • Freed space: {freed_space / (1024**3):.2f} GB")
+
+    input("\nPress Enter to continue...")
+
+
+def delete_old_experiments():
+    """Delete experiments whose sample weights predate the 2026-10-28 alignment fix"""
+    import shutil
+    import yaml
+    from ml_pipeline.models.sample_weights_numba import SAMPLE_WEIGHTS_VERSION
+
+    print("\n" + "="*60)
+    print(" 🗑️  Delete Old Experiments ")
+    print("="*60)
+    print(f"\nOld = experiment_metadata.json without sample_weights_version >= {SAMPLE_WEIGHTS_VERSION}")
+    print("   (each row of their sample_weights.parquet carries an earlier event's weight)")
+
+    # Experiment folders live under the config output_path (data/...); output/ is checked too
+    experiments = []
+    for root in (Path("data"), Path("output")):
+        if root.exists():
+            experiments += [p for p in root.rglob("experiment_*") if p.is_dir()]
+    experiments = sorted(p for p in experiments if not any(parent in experiments for parent in p.parents))
+
+    old_experiments = []
+    for exp in experiments:
+        try:
+            with open(exp / "experiment_metadata.json") as f:
+                version = json.load(f).get("sample_weights_version", 1)
+        except (OSError, ValueError):
+            version = 1  # no readable metadata: treat as old
+        if version < SAMPLE_WEIGHTS_VERSION:
+            old_experiments.append(exp)
+
+    print(f"\n📊 Found {len(experiments)} experiments, {len(old_experiments)} old")
+
+    if not old_experiments:
+        print("\n✅ No old experiments found.")
+        input("\nPress Enter to continue...")
+        return
+
+    # The live paper trading loads its model from live.experiment_dir
+    live_dir = None
+    try:
+        with open(Path("src") / "config.yaml") as f:
+            live_dir = (yaml.safe_load(f).get("live") or {}).get("experiment_dir")
+    except (OSError, yaml.YAMLError):
+        pass
+
+    total_size = 0
+    for exp in old_experiments:
+        size = sum(f.stat().st_size for f in exp.rglob('*') if f.is_file())
+        total_size += size
+        has_model = (exp / "model").is_dir()
+        in_live = live_dir is not None and Path(live_dir).resolve() == exp.resolve()
+        print(f"   - {exp}  ({size / (1024**2):.1f} MB{', trained model' if has_model else ''})"
+              f"{'  ⚠️  used by live.experiment_dir' if in_live else ''}")
+    print(f"   • Total size: {total_size / (1024**3):.2f} GB")
+
+    print("\n🔴 THIS ACTION CANNOT BE UNDONE!")
+    confirm = input(f"\n❓ Delete these {len(old_experiments)} old experiments? (yes/no): ").strip().lower()
+
+    if confirm != 'yes':
+        print("❌ Deletion cancelled.")
+        input("\nPress Enter to continue...")
+        return
+
+    deleted = 0
+    freed_space = 0
+
+    print("\n🗑️  Deleting old experiments...")
+
+    for exp in old_experiments:
+        try:
+            dir_size = sum(f.stat().st_size for f in exp.rglob('*') if f.is_file())
+            shutil.rmtree(exp)
+            deleted += 1
+            freed_space += dir_size
+            print(f"   ✓ Deleted {exp}")
+        except Exception as e:
+            print(f"   ✗ Failed to delete {exp}: {e}")
+
+    print(f"\n✅ Old experiments deleted!")
+    print(f"   • Deleted experiments: {deleted}")
     print(f"   • Freed space: {freed_space / (1024**3):.2f} GB")
 
     input("\nPress Enter to continue...")
@@ -2802,7 +2887,7 @@ def interactive_main():
     while True:
         display_pipeline_menu(config)
 
-        choice = input("\nEnter your choice (0-9): ").strip()
+        choice = input("\nEnter your choice (0-10): ").strip()
 
         if choice == "1":
             # Complete pipeline with improved date suggestions
@@ -2839,11 +2924,13 @@ def interactive_main():
             delete_all_data()
         elif choice == "9":
             run_search_classificator(config)
+        elif choice == "10":
+            delete_old_experiments()
         elif choice == "0":
             print("\n👋 Goodbye!")
             break
         else:
-            print("❌ Invalid choice. Please enter 0-9.")
+            print("❌ Invalid choice. Please enter 0-10.")
 
 
 def main():

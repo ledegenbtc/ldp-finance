@@ -1237,7 +1237,8 @@ def calculate_pbo_from_cpcv(
 
         # Calculate fold score
         try:
-            score = log_loss(y_test, y_pred_proba)
+            sw_test = sample_weight[test_idx] if sample_weight is not None else None
+            score = log_loss(y_test, y_pred_proba, sample_weight=sw_test, labels=[0, 1])
         except Exception:
             score = np.nan
         cv_scores.append(score)

@@ -7,6 +7,12 @@ import pandas as pd
 from numba import njit
 import time
 
+# Version of the sample_weights.parquet that feature_generator writes, recorded as
+# sample_weights_version in experiment_metadata.json.
+# 2 (2026-10-28): weights aligned to X_train by event timestamp. Experiments without it
+# carry, on each row, the weight of an earlier event.
+SAMPLE_WEIGHTS_VERSION = 2
+
 
 @njit
 def calculate_uniqueness_numba(t1_array, timestamps):

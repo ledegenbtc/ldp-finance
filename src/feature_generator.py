@@ -85,6 +85,7 @@ from ml_pipeline.feature_engineering.unified_microstructure_features import Unif
 
 # Model modules
 from ml_pipeline.models.improved_ar_model import ImprovedAutoRegressiveModel
+from ml_pipeline.models.sample_weights_numba import SAMPLE_WEIGHTS_VERSION
 
 # ============================================================================
 # LOGGING CONFIGURATION
@@ -1464,6 +1465,7 @@ def main(config_path=None):
             'source_path': DATA_PATH,
             'created_at': datetime.now().isoformat(),
             'pipeline_type': 'feature_generator',
+            'sample_weights_version': SAMPLE_WEIGHTS_VERSION,
             'config': config
         }
 
@@ -2069,8 +2071,12 @@ def main(config_path=None):
         logger.info(f"   Saved: {y_train_path}")
 
         # Save sample weights
+        # Weights were computed for every IS event, but X_train drops the warm-up events:
+        # align by event timestamp (a positional slice shifted each row onto an earlier event's weight)
+        weights_by_event = pd.Series(normalized_weights_pure, index=triple_barrier_events_IS.index)
+        aligned_weights = weights_by_event.loc[X_train.index].to_numpy()
         weights_df = pd.DataFrame({
-            'weight': normalized_weights_pure[:len(X_train)]
+            'weight': aligned_weights
         }, index=X_train.index)
         weights_path = os.path.join(features_dir, 'sample_weights.parquet')
         weights_df.to_parquet(weights_path)
@@ -2136,7 +2142,7 @@ def main(config_path=None):
             'report_dir': report_dir,
             'X_train': X_train,
             'y_train': y_train,
-            'sample_weights': normalized_weights_pure[:len(X_train)]
+            'sample_weights': aligned_weights
         }
 
     except Exception as e:

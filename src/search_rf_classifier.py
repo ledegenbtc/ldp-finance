@@ -18,6 +18,11 @@ This script performs:
 - Random Forest training with Optuna hyperparameter optimization
 - Feature importance analysis
 - Visualization generation
+
+NOTE: this all-in-one script still has the sample-weight defects fixed on 2026-10-28 in
+feature_generator.py + rf_trainer.py: weights sliced by position (each row gets an earlier
+event's weight once the warm-up events are dropped), unweighted validation log-loss, and
+cross_val_predict fitting the OOF forests without weights. Use the two-stage flow instead.
 """
 
 # ============================================================================

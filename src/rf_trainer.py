@@ -68,12 +68,12 @@ import psutil
 # Add src directory to Python path
 sys.path.insert(0, os.path.dirname(__file__))
 
+from sklearn.base import clone
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
     classification_report, confusion_matrix, roc_auc_score, roc_curve,
     precision_score, recall_score, f1_score, accuracy_score, log_loss
 )
-from sklearn.model_selection import cross_val_predict
 
 # Optuna for hyperparameter optimization
 import optuna
@@ -300,6 +300,32 @@ def load_features(features_dir):
     return X_train, y_train, sample_weights, feature_names, triple_barrier_events
 
 
+def cv_iterator(cv_strategy, X, use_cpcv):
+    """(train_idx, val_idx) pairs: CPCV.split yields a third value (combination_idx), sklearn_split drops it."""
+    return cv_strategy.sklearn_split(X) if use_cpcv else cv_strategy.split(X)
+
+
+def weighted_oof_proba(model, X, y, sample_weights, cv_strategy, use_cpcv):
+    """Out-of-fold P(class 1) from clones of `model` fitted WITH sample weights.
+
+    cross_val_predict is not used: it fits without sample_weight and only accepts
+    partitions, while CPCV tests each observation in several combinations. With CPCV
+    the OOF probability is the mean over the paths that cover the observation (each
+    combination where it is test belongs to exactly one path, AFML 12.4).
+    """
+    proba_sum = np.zeros(len(X))
+    n_preds = np.zeros(len(X))
+    for train_idx, val_idx in cv_iterator(cv_strategy, X, use_cpcv):
+        fold_model = clone(model)
+        fold_model.fit(X.iloc[train_idx], y[train_idx], sample_weight=sample_weights[train_idx])
+        proba_sum[val_idx] += fold_model.predict_proba(X.iloc[val_idx])[:, 1]
+        n_preds[val_idx] += 1
+
+    if (n_preds == 0).any():
+        raise ValueError(f"{int((n_preds == 0).sum())} observations were never in a validation fold")
+    return proba_sum / n_preds
+
+
 # ============================================================================
 # 3. MAIN TRAINING PIPELINE
 # ============================================================================
@@ -387,20 +413,20 @@ def main(features_dir=None, config_path=None):
             y_train = y_train.loc[valid_idx]
             triple_barrier_events = triple_barrier_events.loc[valid_idx]
 
-            # Handle sample_weights - convert to series with index for alignment
-            weights_series = pd.Series(sample_weights, index=feature_names.get('original_index', range(len(sample_weights))))
-            if len(weights_series) == n_before:
-                # Rebuild weights series with X_train's original index before lag generation
-                weights_df = pd.read_parquet(os.path.join(features_dir, 'sample_weights.parquet'))
-                sample_weights = weights_df.loc[valid_idx, 'weight'].values
-            else:
-                sample_weights = sample_weights[:len(X_train)]
+            # sample_weights.parquet is indexed like X_train: align by timestamp, never by position
+            weights_df = pd.read_parquet(os.path.join(features_dir, 'sample_weights.parquet'))
+            sample_weights = weights_df.loc[valid_idx, 'weight'].values
 
             n_after = len(X_train)
             logger.info(f"   Rows before dropna: {n_before}")
             logger.info(f"   Rows after dropna: {n_after}")
             logger.info(f"   Rows dropped: {n_before - n_after}")
             logger.info(f"   Final feature matrix: {X_train.shape}")
+
+        if len(sample_weights) != len(X_train):
+            raise ValueError(
+                f"sample_weights ({len(sample_weights)}) and X_train ({len(X_train)}) have different lengths"
+            )
 
         log_memory("generate lags")
         logger.info(f"Step 1B completed in {time.time() - step_start:.2f} seconds")
@@ -488,13 +514,7 @@ def main(features_dir=None, config_path=None):
             rf = RandomForestClassifier(**params)
 
             cv_scores = []
-            # Use sklearn_split for CPCV (returns 2 values), regular split for PurgedKFold
-            if use_cpcv:
-                cv_iterator = cv_strategy.sklearn_split(X_train)
-            else:
-                cv_iterator = cv_strategy.split(X_train)
-
-            for fold_idx, (train_idx, val_idx) in enumerate(cv_iterator):
+            for fold_idx, (train_idx, val_idx) in enumerate(cv_iterator(cv_strategy, X_train, use_cpcv)):
                 X_fold_train = X_train.iloc[train_idx]
                 y_fold_train = y_train.values.ravel()[train_idx]
                 X_fold_val = X_train.iloc[val_idx]
@@ -503,7 +523,9 @@ def main(features_dir=None, config_path=None):
 
                 rf.fit(X_fold_train, y_fold_train, sample_weight=weights_fold)
                 y_pred_proba = rf.predict_proba(X_fold_val)[:, 1]
-                fold_score = log_loss(y_fold_val, y_pred_proba)
+                # Weighted validation score, like the cvScore of AFML 7.4
+                fold_score = log_loss(y_fold_val, y_pred_proba,
+                                      sample_weight=sample_weights[val_idx], labels=[0, 1])
                 cv_scores.append(fold_score)
 
                 trial.report(np.mean(cv_scores), fold_idx)
@@ -551,7 +573,7 @@ def main(features_dir=None, config_path=None):
         best_params['n_jobs'] = -1
 
         rf_model = RandomForestClassifier(**best_params)
-        rf_model.fit(X_train, y_train.values.ravel(), sample_weight=sample_weights[:len(X_train)])
+        rf_model.fit(X_train, y_train.values.ravel(), sample_weight=sample_weights)
 
         logger.info(f"\nOptuna optimization completed in {train_time:.2f} seconds")
 
@@ -575,21 +597,11 @@ def main(features_dir=None, config_path=None):
         y_pred_train = rf_model.predict(X_train)
         y_pred_proba_train = rf_model.predict_proba(X_train)[:, 1]
 
-        # CV predictions - create sklearn-compatible CV iterator
-        if use_cpcv:
-            # For CPCV, use sklearn_split which returns (train, test) only
-            cv_for_sklearn = list(cv_strategy.sklearn_split(X_train))
-        else:
-            cv_for_sklearn = cv_strategy
-
-        y_pred_cv = cross_val_predict(
-            rf_model, X_train, y_train.values.ravel(),
-            cv=cv_for_sklearn, method='predict', n_jobs=-1
+        # CV predictions from forests fitted with the sample weights (mean over paths with CPCV)
+        y_pred_proba_cv = weighted_oof_proba(
+            rf_model, X_train, y_train.values.ravel(), sample_weights, cv_strategy, use_cpcv
         )
-        y_pred_proba_cv = cross_val_predict(
-            rf_model, X_train, y_train.values.ravel(),
-            cv=cv_for_sklearn, method='predict_proba', n_jobs=-1
-        )[:, 1]
+        y_pred_cv = (y_pred_proba_cv > 0.5).astype(int)  # same as the forest's predict (argmax)
 
         # Metrics
         logger.info("\nTraining Metrics (In-Sample):")
@@ -634,7 +646,7 @@ def main(features_dir=None, config_path=None):
                 X=X_train,
                 y=y_train.iloc[:, 0] if hasattr(y_train, 'iloc') else pd.Series(y_train.values.ravel(), index=X_train.index),
                 cpcv=cv_strategy_pbo,
-                sample_weight=sample_weights[:len(X_train)]
+                sample_weight=sample_weights
             )
 
             logger.info(f"\nPBO Results:")
@@ -724,7 +736,8 @@ def main(features_dir=None, config_path=None):
                 rf = RandomForestClassifier(**params)
 
                 cv_scores = []
-                for fold_idx, (train_idx, val_idx) in enumerate(cv_strategy.split(X_train_selected)):
+                for fold_idx, (train_idx, val_idx) in enumerate(
+                        cv_iterator(cv_strategy, X_train_selected, use_cpcv)):
                     X_fold_train = X_train_selected.iloc[train_idx]
                     y_fold_train = y_train.values.ravel()[train_idx]
                     X_fold_val = X_train_selected.iloc[val_idx]
@@ -733,7 +746,8 @@ def main(features_dir=None, config_path=None):
 
                     rf.fit(X_fold_train, y_fold_train, sample_weight=weights_fold)
                     y_pred_proba = rf.predict_proba(X_fold_val)[:, 1]
-                    fold_score = log_loss(y_fold_val, y_pred_proba)
+                    fold_score = log_loss(y_fold_val, y_pred_proba,
+                                          sample_weight=sample_weights[val_idx], labels=[0, 1])
                     cv_scores.append(fold_score)
 
                     trial.report(np.mean(cv_scores), fold_idx)
@@ -775,22 +789,13 @@ def main(features_dir=None, config_path=None):
 
             rf_model_selected = RandomForestClassifier(**best_params_sel)
             rf_model_selected.fit(X_train_selected, y_train.values.ravel(),
-                                  sample_weight=sample_weights[:len(X_train_selected)])
+                                  sample_weight=sample_weights)
 
-            # Compare results - use sklearn-compatible CV iterator
-            if use_cpcv:
-                cv_for_sklearn_sel = list(cv_strategy.sklearn_split(X_train_selected))
-            else:
-                cv_for_sklearn_sel = cv_strategy
-
-            y_pred_cv_sel = cross_val_predict(
-                rf_model_selected, X_train_selected, y_train.values.ravel(),
-                cv=cv_for_sklearn_sel, method='predict', n_jobs=-1
+            # Compare results - OOF from forests fitted with the sample weights
+            y_pred_proba_cv_sel = weighted_oof_proba(
+                rf_model_selected, X_train_selected, y_train.values.ravel(), sample_weights, cv_strategy, use_cpcv
             )
-            y_pred_proba_cv_sel = cross_val_predict(
-                rf_model_selected, X_train_selected, y_train.values.ravel(),
-                cv=cv_for_sklearn_sel, method='predict_proba', n_jobs=-1
-            )[:, 1]
+            y_pred_cv_sel = (y_pred_proba_cv_sel > 0.5).astype(int)
 
             auc_all = roc_auc_score(y_train, y_pred_proba_cv)
             ll_all = log_loss(y_train, y_pred_proba_cv)
